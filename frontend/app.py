@@ -19,7 +19,8 @@ st.markdown("""
 /* --- resets --- */
 * { box-sizing: border-box; }
 .block-container { padding: 0 !important; max-width: 100% !important; }
-header[data-testid="stHeader"] { display: none !important; }
+header[data-testid="stHeader"] { background: rgba(0,0,0,0) !important;
+    color: white !important; }
 .stDeployButton, #MainMenu, footer { display: none !important; }
 section[data-testid="stSidebar"] { top: 0 !important; }
 div.stMarkdown p { margin-bottom: 0 !important; }
