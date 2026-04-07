@@ -569,9 +569,9 @@ with st.sidebar:
     st.link_button("🌳  Urban Forestry & Trees",
                    "https://www.toronto.ca/services-payments/water-environment/trees/",
                    use_container_width=True)
-    st.link_button("🏘  Zoning & Land Use",
-                   "https://www.toronto.ca/city-government/planning-development/zoning-by-law-project/",
-                   use_container_width=True)
+    # st.link_button("🏘  Zoning & Land Use",
+    #                "https://www.toronto.ca/city-government/planning-development/zoning-by-law-project/",
+    #                use_container_width=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("""
