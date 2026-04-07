@@ -43,7 +43,7 @@ class Message(Base):
     conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False)
     role = Column(String(50), nullable=False)  # "user" or "assistant"
     content = Column(Text, nullable=False)
-    metadata = Column(JSON, default={})  # For intent, citations, etc.
+    msg_metadata = Column("metadata", JSON, default={})  # For intent, citations, etc.
     created_at = Column(DateTime, default=datetime.utcnow)
     
     conversation = relationship("Conversation", back_populates="messages")

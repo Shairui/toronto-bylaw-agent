@@ -136,16 +136,16 @@ async def send_message(
             conversation_id=conversation_id,
             role="user",
             content=request.message,
-            metadata={"intent": agent_response.intent.value}
+            msg_metadata={"intent": agent_response.intent.value}
         )
         db.add(user_msg)
-        
+
         # Save assistant response
         assistant_msg = Message(
             conversation_id=conversation_id,
             role="assistant",
             content=agent_response.message,
-            metadata={
+            msg_metadata={
                 "intent": agent_response.intent.value,
                 "citations": agent_response.citations
             }
@@ -162,9 +162,11 @@ async def send_message(
             )
             db.add(action)
         
-        # Update conversation state
-        if agent_response.action and agent_response.action["type"] == "hazard_report":
+        # Update conversation state for any active multi-turn flow
+        if agent_response.action and agent_response.action["status"] == "in_progress":
             conversation.state = agent_response.action["data"]
+        elif agent_response.action and agent_response.action["status"] == "completed":
+            conversation.state = {}  # Clear state once flow is complete
         
         db.commit()
         
@@ -192,7 +194,7 @@ async def get_messages(
                 "id": msg.id,
                 "role": msg.role,
                 "content": msg.content,
-                "metadata": msg.metadata,
+                "metadata": msg.msg_metadata,
                 "created_at": msg.created_at.isoformat()
             }
             for msg in messages
