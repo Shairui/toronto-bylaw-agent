@@ -7,31 +7,38 @@ A conversational AI assistant for Toronto municipal services, built for RSM8430 
 ## File Structure
 
 ```
-streamlit_app.py          ← Streamlit UI: fixed nav, CSS, session state, message
-                            rendering, conversation history sidebar, quick-action cards
-backend/
-  config.py               ← All env vars loaded from .env / Streamlit Secrets
-  llm.py                  ← Async LLM client using Groq (llama-3.3-70b-versatile)
-  rag.py                  ← ChromaDB vector store. Builds 182-document knowledge base
-                            from real data in excel/. Returns cosine distances for
-                            relevance filtering. Falls back to keyword search when empty.
-  agent.py                ← Intent classifier, guardrails, multi-turn handlers,
-                            RAG relevance threshold, hazard ticket extraction
-evaluation.py             ← 15-case evaluation script with optional LLM-as-judge
-                            scoring via Claude (set ANTHROPIC_API_KEY to enable).
-                            Writes results to data/
-tests/
-  test_agent.py           ← pytest suite: intent classification, guardrails,
-                            multi-turn hazard flow, integration tests
-excel/
-  Waste Wizard Lookup Table.json          ← 2,206 official City of Toronto waste items
-                                            (source for RAG waste documents)
-  Cleared Building Permits since 2017.json ← 392,000 permit records
-                                            (top 150 approved permits indexed in RAG)
-  311_service_requests.csv                ← 500,000 311 service request records
-data/
-  chroma_db/              ← ChromaDB vector store (auto-created and wiped at startup)
-  knowledge_base.json     ← Optional: place here to override the built-in documents
+toronto-bylaw-agent/
+├── streamlit_app.py              ← Streamlit UI: fixed nav, CSS, session state,
+│                                    message rendering, sidebar, quick-action cards
+├── evaluation.py                 ← Eval runner; loads cases from evaluation_cases.json;
+│                                    optional Claude-as-judge (set ANTHROPIC_API_KEY)
+├── evaluation_cases.json         ← 15 labelled test cases (query, intent, keywords)
+├── requirements.txt
+│
+├── backend/
+│   ├── config.py                 ← All env vars (.env locally, Streamlit Secrets in prod)
+│   ├── llm.py                    ← Async Groq client (llama-3.3-70b-versatile)
+│   ├── system_prompt.txt         ← LLM system prompt template ({objective}, {retrieved_context})
+│   ├── rag.py                    ← ChromaDB vector store; builds 182-doc knowledge base
+│   │                                from excel/ files; cosine distance relevance filtering
+│   └── agent.py                  ← Intent classifier, guardrails, multi-turn handlers,
+│                                    RAG threshold, hazard ticket extraction
+│
+├── tests/
+│   └── test_agent.py             ← pytest suite: classification, guardrails, multi-turn
+│
+├── excel/                        ← Data sources (City of Toronto Open Data)
+│   ├── Waste Wizard Lookup Table.json        ← 2,206 waste items (loaded into RAG)
+│   ├── regulatory_bylaws.json                ← 21 key bylaw texts (zoning, noise, parking…)
+│   ├── Cleared Building Permits since 2017.json  ← 392k records (gitignored, too large)
+│   └── 311_service_requests.csv             ← 500k records (gitignored, too large)
+│
+├── data/
+│   ├── knowledge_base.json       ← Pre-built RAG docs (182 total, committed to git)
+│   └── chroma_db/                ← Vector store (auto-created at startup, gitignored)
+│
+└── .streamlit/
+    └── config.toml               ← Streamlit server settings for deployment
 ```
 
 ---
