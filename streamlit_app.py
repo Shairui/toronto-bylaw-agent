@@ -28,11 +28,35 @@ st.markdown("""
 <style>
 /* --- resets --- */
 * { box-sizing: border-box; }
-.block-container { padding: 0 !important; max-width: 100% !important; }
-header[data-testid="stHeader"] { background: rgba(0,0,0,0) !important;
-    color: white !important; }
+
+/* ── Kill every Streamlit chrome element that creates the white strip ── */
+header[data-testid="stHeader"],
+[data-testid="stDecoration"],
+[data-testid="stToolbar"],
+[data-testid="stStatusWidget"],
 .stDeployButton, #MainMenu, footer { display: none !important; }
-section[data-testid="stSidebar"] { top: 0 !important; }
+
+/* ── Zero out all top spacing on every container that could add it ── */
+html, body,
+.stApp,
+[data-testid="stAppViewContainer"],
+[data-testid="stMain"],
+[data-testid="stMainBlockContainer"],
+.block-container,
+[data-testid="stMain"] > div:first-child {
+    padding-top: 0 !important;
+    margin-top: 0 !important;
+    --header-height: 0px !important;
+}
+
+.block-container {
+    padding-top: 68px !important;
+    padding-left: 2rem !important;
+    padding-right: 2rem !important;
+    padding-bottom: 0 !important;
+    max-width: 100% !important;
+}
+
 div.stMarkdown p { margin-bottom: 0 !important; }
 
 /* ============================================================
@@ -117,7 +141,9 @@ div[data-testid="stSidebar"] * { color: #1E3A8A; }
     height: 60px; display: flex; align-items: center;
     justify-content: space-between; padding: 0 2rem;
     box-shadow: 0 2px 12px rgba(0,0,0,.25);
-    position: sticky; top: 0; z-index: 1000;
+    position: fixed; top: 0; left: 0; right: 0;
+    z-index: 999999;
+    width: 100vw;
 }
 .nav-left { display: flex; align-items: center; gap: 14px; }
 .nav-logo {
@@ -289,6 +315,27 @@ div.action-cards .stButton > button:hover {
 .cite-title { color: #1E293B; font-weight: 600; margin: 3px 0; font-size: .9rem; }
 .cite-exc { color: #64748B; line-height: 1.55; }
 
+/* history buttons */
+div[data-testid="stSidebar"] .hist-btn > button {
+    background: transparent !important;
+    border: 1px solid #DBEAFE !important;
+    color: #1E40AF !important;
+    border-radius: 8px !important;
+    font-size: .82rem !important;
+    width: 100% !important;
+    padding: .38rem .7rem !important;
+    margin-bottom: 4px !important;
+    text-align: left !important;
+    font-weight: 400 !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+}
+div[data-testid="stSidebar"] .hist-btn > button:hover {
+    background: #DBEAFE !important;
+    border-color: #93C5FD !important;
+}
+
 /* chat input */
 .stChatInput textarea {
     border-radius: 26px !important;
@@ -382,34 +429,13 @@ def action_card_html(action: dict) -> str:
 <div class="acard-row"><span class="acard-key">Response Time</span>
 <span class="acard-val">24–48 hours</span></div>
 </div>"""
-        n = sum(1 for f in ["location", "hazard_type", "description"] if f in data)
-        rows = "".join(
-            f'<div class="acard-row"><span class="acard-key">'
-            f'{k.replace("_"," ").title()}</span>'
-            f'<span class="acard-val">{data[k]}</span></div>'
-            for k in ["location", "hazard_type", "description"] if k in data
-        )
-        return f"""<div class="acard acard-hazard">
-<div class="acard-lbl">🚧 Report in Progress — Step {n+1}/3</div>
-{rows}</div>"""
+        return ""
 
-    if t == "permit_screener":
-        raw = data.get("decision", "")
-        u = raw.upper()
-        cls = "dec-yes" if "YES" in u else "dec-no" if "NO" in u else "dec-maybe"
-        icon = "✅" if "YES" in u else "🔵" if "NO" in u else "⚠️"
-        proj = data.get("project_description", "")[:70]
-        return f"""<div class="acard acard-permit">
-<div class="acard-lbl">🏗 Permit Screening Result</div>
-<div class="acard-row"><span class="acard-key">Decision</span>
-<span class="{cls}">{icon} {raw or 'See response'}</span></div>
-<div class="acard-row"><span class="acard-key">Project</span>
-<span class="acard-val">{proj}…</span></div>
-</div>"""
-
-    if t == "collection_lookup":
-        day = data.get("collection_day", "—")
+    if t == "collection_lookup" and status == "completed":
+        day = data.get("collection_day", "")
         pc = data.get("postal_code", "")
+        if not day and not pc:
+            return ""
         pc_fmt = f"{pc[:3]} {pc[3:]}" if len(pc) >= 6 else pc
         return f"""<div class="acard acard-collection">
 <div class="acard-lbl">♻️ Collection Schedule</div>
@@ -467,10 +493,75 @@ def render_message(msg: dict):
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
-for k, v in [("messages", []), ("conv_state", {}), ("quick_send", None)]:
+for k, v in [
+    ("messages", []),
+    ("conv_state", {}),
+    ("quick_send", None),
+    ("permit_form_active", False),
+    ("conversations", []),
+    ("current_conv_id", None),
+]:
     if k not in st.session_state:
         st.session_state[k] = v
 
+
+def _save_current_conversation():
+    msgs = st.session_state.messages
+    if not msgs:
+        return
+    title = next((m["content"][:45] for m in msgs if m["role"] == "user"), "Conversation")
+    conv_id = st.session_state.current_conv_id
+    if conv_id is None:
+        import uuid
+        conv_id = str(uuid.uuid4())[:8]
+        st.session_state.current_conv_id = conv_id
+    entry = {
+        "id": conv_id,
+        "title": title,
+        "messages": list(msgs),
+        "conv_state": dict(st.session_state.conv_state),
+        "timestamp": fmt_time(),
+    }
+    for i, c in enumerate(st.session_state.conversations):
+        if c["id"] == conv_id:
+            st.session_state.conversations[i] = entry
+            return
+    st.session_state.conversations.insert(0, entry)
+
+
+# ── Remove Streamlit top padding via JS (CSS alone can't beat JS inline styles) ──
+st.markdown("""
+<script>
+(function() {
+    var selectors = [
+        '[data-testid="stMain"]',
+        '[data-testid="stAppViewContainer"]',
+        '[data-testid="stMainBlockContainer"]',
+        '.block-container',
+        'header[data-testid="stHeader"]',
+        '[data-testid="stDecoration"]',
+        '[data-testid="stToolbar"]',
+    ];
+    function zeroTop() {
+        selectors.forEach(function(sel) {
+            var el = document.querySelector(sel);
+            if (el) {
+                el.style.setProperty('padding-top', '0px', 'important');
+                el.style.setProperty('margin-top', '0px', 'important');
+                if (sel.includes('Header') || sel.includes('Decoration') || sel.includes('Toolbar')) {
+                    el.style.setProperty('display', 'none', 'important');
+                }
+            }
+        });
+    }
+    zeroTop();
+    setTimeout(zeroTop, 100);
+    setTimeout(zeroTop, 500);
+    var obs = new MutationObserver(zeroTop);
+    obs.observe(document.documentElement, {subtree: true, attributes: true, attributeFilter: ['style']});
+})();
+</script>
+""", unsafe_allow_html=True)
 
 # ── Top nav ───────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -519,10 +610,32 @@ with st.sidebar:
     st.markdown('<div class="sb-section"><div class="sb-label">Conversation</div>',
                 unsafe_allow_html=True)
     if st.button("➕  New Conversation", key="new_conv", use_container_width=True):
+        _save_current_conversation()
         st.session_state.messages = []
         st.session_state.conv_state = {}
+        st.session_state.current_conv_id = None
+        st.session_state.permit_form_active = False
         st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
+
+    if st.session_state.conversations:
+        st.markdown('<div class="sb-section"><div class="sb-label">History</div>',
+                    unsafe_allow_html=True)
+        for conv in st.session_state.conversations:
+            label = conv["title"]
+            if len(label) > 42:
+                label = label[:42] + "…"
+            st.markdown('<div class="hist-btn">', unsafe_allow_html=True)
+            if st.button(f"💬  {label}", key=f"hist_{conv['id']}",
+                         use_container_width=True):
+                _save_current_conversation()
+                st.session_state.messages = list(conv["messages"])
+                st.session_state.conv_state = dict(conv["conv_state"])
+                st.session_state.current_conv_id = conv["id"]
+                st.session_state.permit_form_active = False
+                st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="sb-section"><div class="sb-label">City Services</div>',
                 unsafe_allow_html=True)
@@ -568,17 +681,53 @@ if not st.session_state.messages:
     qa_items = [
         ("🚧", "Report a Hazard",
          "I need to report a hazard in Toronto"),
-        ("🏗", "Check Permit Required",
-         "Do I need a building permit for my project?"),
-        ("♻️", "Waste Collection Day",
-         "When is my garbage collection day? My postal code is M5V 3A8"),
+        ("🏗", "Check Permit Required", None),
+        ("♻️", "Waste Disposal Guide",
+         "What are the disposal instructions for common household items like pizza boxes, batteries, electronics, furniture, and paint?"),
     ]
     for i, (icon, label, prompt) in enumerate(qa_items):
         with qa_cols[i]:
             if st.button(f"{icon}\n{label}", key=f"qa_card_{i}",
                          use_container_width=True):
-                st.session_state.quick_send = prompt
+                if prompt is None:
+                    st.session_state.permit_form_active = True
+                else:
+                    st.session_state.quick_send = prompt
     st.markdown('</div></div>', unsafe_allow_html=True)
+
+    if st.session_state.permit_form_active:
+        st.markdown("""
+<div style="max-width:700px;margin:1.2rem auto 0;padding:0 1.4rem">
+  <div style="background:white;border:1.5px solid #BBF7D0;border-radius:16px;padding:1.4rem 1.6rem;
+              box-shadow:0 4px 16px rgba(34,197,94,.1)">
+    <div style="color:#15803D;font-size:.8rem;font-weight:800;text-transform:uppercase;
+                letter-spacing:1px;margin-bottom:.9rem">🏗 Permit Check</div>
+""", unsafe_allow_html=True)
+        postal_code = st.text_input(
+            "Your postal code",
+            placeholder="e.g. M5V 3A8",
+            key="permit_postal_input",
+            label_visibility="visible",
+        )
+        project_desc = st.text_input(
+            "Briefly describe your project",
+            placeholder="e.g. Adding a deck to the backyard",
+            key="permit_project_input",
+            label_visibility="visible",
+        )
+        col_sub, col_cancel = st.columns([1, 1])
+        with col_sub:
+            if st.button("Check Permit", key="permit_submit", use_container_width=True):
+                if postal_code.strip():
+                    parts = [f"I'd like to check if I need a building permit. My postal code is {postal_code.strip()}."]
+                    if project_desc.strip():
+                        parts.append(f"Project: {project_desc.strip()}")
+                    st.session_state.quick_send = " ".join(parts)
+                    st.session_state.permit_form_active = False
+        with col_cancel:
+            if st.button("Cancel", key="permit_cancel", use_container_width=True):
+                st.session_state.permit_form_active = False
+        st.markdown("</div></div>", unsafe_allow_html=True)
 
 # ── Chat messages ─────────────────────────────────────────────────────────────
 if st.session_state.messages:
@@ -603,8 +752,16 @@ if prompt:
 
     with st.spinner(""):
         try:
+            chat_history = [
+                {"role": m["role"], "content": m["content"]}
+                for m in st.session_state.messages[:-1]
+            ]
             resp_obj = asyncio.run(
-                agent.process_message(prompt, copy.deepcopy(st.session_state.conv_state))
+                agent.process_message(
+                    prompt,
+                    copy.deepcopy(st.session_state.conv_state),
+                    chat_history=chat_history,
+                )
             )
             # Update multi-turn conversation state from response
             if resp_obj.action:
@@ -636,4 +793,5 @@ if prompt:
                 "timestamp": fmt_time(),
             })
 
+    _save_current_conversation()
     st.rerun()

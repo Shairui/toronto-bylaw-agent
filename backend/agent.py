@@ -1,15 +1,117 @@
-"""Agent logic for Toronto Bylaw Conversational Agent.
+"""
+agent.py — Core conversational logic for the Toronto Bylaw Agent.
 
-Plan A (LLM-powered): active when LLM_API_KEY is set in the environment.
-Plan B (rule-based):   active automatically when no API key is available.
-Switch from B → A: set the LLM_API_KEY env var and restart the server.
+All responses are LLM-generated with RAG context injected into the system prompt.
+No rule-based fallbacks — if the LLM is unavailable, handlers return a 311 redirect.
+
+Key components
+--------------
+SYSTEM_PROMPT_TEMPLATE   System prompt injected into every LLM call. Includes
+                         retrieved RAG context, intent objective, guardrail rules,
+                         multi-turn protocol, and formatting instructions.
+
+_NON_TORONTO_CITIES      Cities rejected by the geographic guardrail (pre-LLM).
+_OOS_PATTERNS            Regex for clearly off-topic queries (weather, politics, etc.).
+_RAG_THRESHOLD           Cosine distance cutoff (0.80) — RAG docs above this are
+                         dropped before being sent as context to the LLM.
+
+Intent (enum)            GENERAL_INQUIRY | HAZARD_REPORT | PERMIT_SCREENER
+                         | COLLECTION_LOOKUP | OUT_OF_SCOPE
+
+AgentResponse            Return type: intent, message, action dict, citations list.
+                         action carries multi-turn state consumed by the Streamlit UI.
+
+TorontoBylawAgent
+  Guardrails             _is_prompt_injection, _is_non_toronto_location,
+                         _is_out_of_scope_topic  (all run before LLM classification)
+  LLM helpers            _llm_respond (RAG retrieval + system prompt assembly + LLM call)
+                         _extract_ticket_data (parse ticket/location/hazard from response)
+  Classifier             classify_intent (LLM call; falls back to GENERAL_INQUIRY on error)
+  Handlers               handle_general_inquiry, handle_hazard_report,
+                         handle_permit_screener, handle_collection_lookup,
+                         handle_out_of_scope
+  Router                 process_message (guardrails → multi-turn state → classify → dispatch)
 """
 import re
 from typing import Dict, Any, List, Optional
 from enum import Enum
 from backend.llm import llm_client
 from backend.rag import rag
-from backend.config import USE_LLM
+
+
+# Plan A system prompt
+# Injected as the first message in every LLM call.
+# {objective} → intent label shown to the model.
+# {retrieved_context} → top-3 RAG documents for grounding.
+
+SYSTEM_PROMPT_TEMPLATE = """\
+Classify the user's message into exactly one of these three categories:
+- hazard_reporter: reporting a safety hazard, dangerous condition, or city infrastructure problem
+- permit_screener: asking about building permits, construction permits, or renovation approvals
+- collection_lookup: asking about waste disposal, recycling, garbage bins, or how to throw something away
+
+You are the Toronto City Bylaw Agent.
+Current Category: {objective}
+You are the official City of Toronto Municipal Assistant.
+1. STRICT GROUNDING: Use ONLY the provided context to answer.
+2. GEOGRAPHIC LIMIT: You only provide information for the city of Toronto.
+3. If the user asks about Vancouver, Montreal, Hamilton, or any non-Toronto location, politely refuse and state you only serve Toronto.
+4. If the provided context does not mention the specific street or item the user asked for, state clearly that no record was found.
+5. Use ONLY the provided context:
+{retrieved_context}
+
+STRICT OPERATING INSTRUCTIONS:
+1. You have access to a local database of city records in the CONTEXT above.
+2. If the CONTEXT contains information about a permit, address, or waste item, you MUST use that data.
+3. DO NOT say you don't have access to real-time data if the information is present in the context.
+
+MULTI-TURN ACTION PROTOCOL:
+- If the user is reporting a Hazard:
+    1. Check USER QUERY and HISTORY for a location (street name / postal code) AND a hazard type.
+    2. If BOTH are present, immediately issue a MOCK service request: SR-2026-XXXXX.
+    3. If location is missing, ask for it. If hazard type is missing, ask for it.
+    4. Never ask for information already supplied in the conversation.
+
+STRICT GUARDRAILS:
+1. Only discuss Toronto municipal services (Hazards, Permits, Waste).
+2. For out-of-scope queries (weather, legal advice, politics, non-Toronto cities), politely decline.
+3. Only provide information grounded in the database context above.
+
+FORMATTING RULES:
+- Use short paragraphs separated by blank lines. Never write a wall of text.
+- Use bullet points (- item) for lists of 3 or more items.
+- Use **bold** for key terms, ticket numbers, and important values.
+- Keep each paragraph to 2-3 sentences maximum.
+
+Citations: Always indicate if information came from the Hazard, Permit, or Waste database.
+"""
+
+# Geographic + topic guardrail data
+
+# Non-Toronto city list (geographic guardrail)
+
+_NON_TORONTO_CITIES = [
+    "hamilton", "vancouver", "montreal", "ottawa", "calgary", "edmonton",
+    "winnipeg", "kitchener", "waterloo", "mississauga", "brampton", "markham",
+    "richmond hill", "vaughan", "oakville", "burlington", "oshawa", "pickering",
+    "ajax", "whitby", "barrie", "kingston", "windsor", "london ontario",
+]
+
+# Out-of-scope topic patterns
+
+_OOS_PATTERNS = re.compile(
+    r"\bweather\s+(like|today|forecast|in|for)\b"
+    r"|what.s the weather"
+    r"|\bweather\b.*\btoday\b"
+    r"|\bstock\s+(price|market)\b"
+    r"|\brecipe\b|\bcooking\b"
+    r"|\bsports?\s+score\b"
+    r"|\belection\b|\bpolitics\b|\bvote\b"
+    r"|\bcapital of\b"           # general geography trivia
+    r"|\bwho\s+is\s+the\s+(president|prime minister|king|queen|ceo)\b"
+    r"|\btranslate\b|\btranslation\b",
+    re.IGNORECASE,
+)
 
 
 class Intent(str, Enum):
@@ -18,6 +120,15 @@ class Intent(str, Enum):
     PERMIT_SCREENER = "permit_screener"
     COLLECTION_LOOKUP = "collection_lookup"
     OUT_OF_SCOPE = "out_of_scope"
+
+
+_INTENT_OBJECTIVE = {
+    Intent.HAZARD_REPORT: "hazard_reporter",
+    Intent.PERMIT_SCREENER: "permit_screener",
+    Intent.COLLECTION_LOOKUP: "collection_lookup",
+    Intent.GENERAL_INQUIRY: "general_inquiry",
+    Intent.OUT_OF_SCOPE: "out_of_scope",
+}
 
 
 class AgentResponse:
@@ -42,7 +153,6 @@ class AgentResponse:
         }
 
 
-# ── Prompt injection patterns ────────────────────────────────────────────────
 _INJECTION_RE = re.compile(
     r"ignore\s+(all\s+)?previous\s+instructions"
     r"|forget\s+(all\s+)?previous\s+instructions"
@@ -56,345 +166,290 @@ _INJECTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+_TICKET_RE = re.compile(r"\bSR-\d{4}-\w+\b", re.IGNORECASE)
+
 
 class TorontoBylawAgent:
 
-    # ── Guardrail ────────────────────────────────────────────────────────────
+    # Guardrails
+    # All four checks run before intent classification in process_message.
+    # They cannot be bypassed by clever phrasing because they run first.
 
     def _is_prompt_injection(self, message: str) -> bool:
         return bool(_INJECTION_RE.search(message))
 
-    # ── Keyword helpers ──────────────────────────────────────────────────────
-
-    def _keyword_classify(self, message: str) -> Intent:
-        """Keyword-based intent classification (Plan B fallback)."""
+    @staticmethod
+    def _is_non_toronto_location(message: str) -> bool:
+        """Return True if the message references a non-Toronto city."""
         msg = message.lower()
-        if any(k in msg for k in [
-            "report", "hazard", "pothole", "fallen tree", "debris",
-            "broken sidewalk", "flooding", "incident", "danger", "unsafe",
-            "damage", "crack", "leak", "spill", "graffiti",
-        ]):
-            return Intent.HAZARD_REPORT
-        if any(k in msg for k in [
-            "permit", "renovation", "renovate", "build", "construction",
-            "deck", "addition", "demolish", "pool", "garage", "fence",
-            "basement", "extension", "structural",
-        ]):
-            return Intent.PERMIT_SCREENER
-        if any(k in msg for k in [
-            "garbage", "collection", "waste", "recycling", "recycle",
-            "green bin", "blue bin", "pickup", "pick up", "compost",
-            "trash", "rubbish", "bin", "bulk",
-        ]):
-            return Intent.COLLECTION_LOOKUP
-        # Default: try to answer using the knowledge base
-        return Intent.GENERAL_INQUIRY
+        return any(city in msg for city in _NON_TORONTO_CITIES)
 
-    def _rule_based_permit(self, message: str) -> tuple:
-        """Return (decision, explanation, steps) without using LLM."""
-        msg = message.lower()
-        yes_kw = [
-            "new construction", "new house", "new building", "add floor",
-            "second floor", "third floor", "addition", "structural",
-            "demolish", "pool", "major renovation", "new garage",
-            "new deck", "extend", "knock down", "tear down",
-        ]
-        no_kw = [
-            "paint", "painting", "wallpaper", "flooring", "carpet",
-            "landscaping", "garden", "minor repair", "replace fixture",
-            "clean", "window cleaning", "caulk", "weather strip",
-        ]
-        if any(k in msg for k in yes_kw):
-            decision = "YES — A building permit is required."
-            explanation = (
-                "Your project involves construction or significant alterations "
-                "that require a building permit under Toronto Municipal Code "
-                "Chapter 363 and the Ontario Building Code."
-            )
-            steps = (
-                "1. Prepare site plan and construction drawings.\n"
-                "2. Apply online at **toronto.ca/building** or call **311**.\n"
-                "3. Pay the permit fee (approx. $13.73 per $1,000 of construction value).\n"
-                "4. Wait for permit approval before starting work."
-            )
-        elif any(k in msg for k in no_kw):
-            decision = "NO — A building permit is likely not required."
-            explanation = (
-                "The work you described (cosmetic/minor repairs) is generally "
-                "exempt from building permit requirements under the Ontario Building Code."
-            )
-            steps = (
-                "No permit needed, but ensure the work meets property standards.\n"
-                "If unsure, call **311** or visit **toronto.ca/building** to confirm."
-            )
-        else:
-            decision = "POSSIBLY — A permit may be required."
-            explanation = (
-                "Based on your description, a building permit may or may not be required "
-                "depending on the scope and structural impact of the work."
-            )
-            steps = (
-                "We recommend confirming with Toronto Building:\n"
-                "- Online: **toronto.ca/building**\n"
-                "- Phone: **311** (ask for Toronto Building)\n"
-                "- In person: visit a Civic Centre"
-            )
-        return decision, explanation, steps
+    @staticmethod
+    def _is_out_of_scope_topic(message: str) -> bool:
+        """Return True if the message is about an off-topic subject (weather, etc.)."""
+        return bool(_OOS_PATTERNS.search(message))
 
-    # ── Intent classification ─────────────────────────────────────────────────
+    # Intent classifier
+    # Plan A: LLM call with few-shot examples (classify_intent).
+    # Plan B: ordered keyword rules (_keyword_classify).
+    #   Priority: geographic guardrail → topic guardrail → hazard → permit → waste → general
 
-    async def classify_intent(self, user_message: str) -> Intent:
-        if not USE_LLM:
-            return self._keyword_classify(user_message)
+    # Unified LLM call (Plan A)
 
-        # ── Plan A: LLM classification ────────────────────────────────────
-        system_prompt = (
+    # RAG cosine-distance threshold — documents above this are too dissimilar to use.
+    _RAG_THRESHOLD = 0.80
+
+    async def _llm_respond(
+        self,
+        intent: Intent,
+        user_message: str,
+        chat_history: List[Dict[str, str]],
+        extra_query: str = "",
+    ) -> tuple:
+        objective = _INTENT_OBJECTIVE.get(intent, "general_inquiry")
+        search_query = f"{user_message} {extra_query}".strip()
+        raw_results = rag.search(search_query, top_k=3)
+        search_results = [r for r in raw_results if r.get("distance", 0.0) < self._RAG_THRESHOLD]
+
+        context_parts, citations = [], []
+        for doc in search_results:
+            cat = doc.get("category", "General")
+            context_parts.append(f"[{cat} Database] {doc['title']}:\n{doc['content']}")
+            citations.append({
+                "title": doc["title"],
+                "source": doc["source"],
+                "excerpt": doc["content"][:250] + "...",
+            })
+
+        retrieved_context = (
+            "\n\n".join(context_parts)
+            if context_parts
+            else "No specific records found in the database for this query."
+        )
+
+        system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+            objective=objective,
+            retrieved_context=retrieved_context,
+        )
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(chat_history or [])
+        messages.append({"role": "user", "content": user_message})
+
+        response_text = await llm_client.invoke(messages)
+        return response_text, citations
+
+    # Intent classification
+
+    async def classify_intent(
+        self, user_message: str, chat_history: List[Dict[str, str]] = None
+    ) -> Intent:
+        classify_system = (
             "You are an intent classifier for a Toronto municipal services agent.\n"
-            "Classify the user's message into one of these categories:\n"
-            '- "general_inquiry": Questions about Toronto bylaws, regulations, or services\n'
-            '- "hazard_report": User wants to report a hazard (pothole, fallen tree, debris, etc.)\n'
-            '- "permit_screener": User wants to know if they need a permit for a project\n'
-            '- "collection_lookup": User wants to know waste collection schedule\n'
-            '- "out_of_scope": Request is not related to Toronto municipal services\n\n'
+            "Classify the user's message (considering conversation history) into exactly one of:\n"
+            '- "hazard_report": User is reporting a hazard or safety problem\n'
+            '- "permit_screener": User is asking about building/construction permits\n'
+            '- "collection_lookup": User is asking about waste disposal or garbage collection\n'
+            '- "general_inquiry": Questions about Toronto bylaws or general services\n'
+            '- "out_of_scope": Unrelated to Toronto municipal services, or references non-Toronto cities\n\n'
+            "If history shows an ongoing hazard report, classify follow-up messages as hazard_report.\n"
             "Respond with ONLY the intent name, nothing else."
         )
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ]
+        messages = [{"role": "system", "content": classify_system}]
+        messages.extend(chat_history or [])
+        messages.append({"role": "user", "content": user_message})
         try:
-            response = await llm_client.invoke(messages, temperature=0.3, max_tokens=50)
+            response = await llm_client.invoke(messages, temperature=0.1, max_tokens=20)
             intent_str = response.lower().strip()
             for intent in Intent:
                 if intent.value in intent_str:
                     return intent
-            return self._keyword_classify(user_message)
+            return Intent.GENERAL_INQUIRY
         except Exception as e:
-            print(f"[Agent] LLM classify error, using keyword fallback: {e}")
-            return self._keyword_classify(user_message)
+            print(f"[Agent] LLM classify error: {e}")
+            return Intent.GENERAL_INQUIRY
 
-    # ── Handlers ─────────────────────────────────────────────────────────────
+    # Handlers
+    # All handlers return an AgentResponse with intent, message, action, citations.
 
-    async def handle_general_inquiry(self, user_message: str) -> AgentResponse:
-        search_results = rag.search(user_message, top_k=3)
-
-        if not search_results:
+    async def handle_general_inquiry(
+        self, user_message: str, chat_history: List[Dict[str, str]] = None
+    ) -> AgentResponse:
+        try:
+            response_text, citations = await self._llm_respond(
+                Intent.GENERAL_INQUIRY, user_message, chat_history or []
+            )
+            return AgentResponse(Intent.GENERAL_INQUIRY, response_text, citations=citations)
+        except Exception as e:
+            print(f"[Agent] LLM general inquiry error: {e}")
             return AgentResponse(
                 intent=Intent.GENERAL_INQUIRY,
                 message=(
-                    "I couldn't find specific information about your query in the "
-                    "Toronto municipal bylaws database. Please try rephrasing your "
-                    "question or contact Toronto 311 at **416-392-8111**."
+                    "I'm unable to process your request right now. "
+                    "Please call **311** or visit **toronto.ca/311** for assistance."
                 ),
             )
 
-        citations = [
-            {
-                "title": doc["title"],
-                "source": doc["source"],
-                "excerpt": doc["content"][:250] + "...",
-            }
-            for doc in search_results
+    @staticmethod
+    def _extract_ticket_data(response_text: str, chat_history: List[Dict], user_message: str) -> Dict[str, str]:
+        """Parse ticket ID, location, and hazard type from the LLM response + conversation."""
+        data: Dict[str, str] = {}
+
+        # Ticket ID
+        m = _TICKET_RE.search(response_text)
+        if m:
+            data["ticket_id"] = m.group(0)
+
+        # Search all text for location and hazard
+        all_text = user_message + " " + " ".join(
+            msg["content"] for msg in (chat_history or []) if msg["role"] == "user"
+        ) + " " + response_text
+
+        # Location: street address or intersection
+        for pat in [
+            r"\b(\d+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+(?:Street|Avenue|Ave|Road|Rd|Blvd|Drive|Dr|St)\b[^,.\n]*)",
+            r"\b([A-Z][a-z]+\s+(?:Street|Avenue|Ave|St)\s+(?:and|&)\s+[A-Z][a-z]+\s+(?:Street|Avenue|Ave|St)\b)",
+        ]:
+            lm = re.search(pat, all_text)
+            if lm:
+                data["location"] = lm.group(1).strip()
+                break
+
+        # Hazard type: pick the first known keyword found
+        hazard_keywords = [
+            ("fallen tree", "fallen tree"), ("falling tree", "fallen tree"),
+            ("pothole", "pothole"), ("flooding", "flooding"), ("flood", "flooding"),
+            ("graffiti", "graffiti"), ("broken sidewalk", "broken sidewalk"),
+            ("broken traffic sign", "broken traffic sign"), ("traffic sign", "broken traffic sign"),
+            ("streetlight", "broken streetlight"), ("street light", "broken streetlight"),
+            ("noise", "noise disturbance"), ("debris", "debris on road"),
+            ("water main", "water main break"), ("fire hydrant", "damaged fire hydrant"),
         ]
+        lower = all_text.lower()
+        for kw, label in hazard_keywords:
+            if kw in lower:
+                data["hazard_type"] = label
+                break
 
-        if USE_LLM:
-            # ── Plan A: synthesise with LLM ───────────────────────────────
-            context = "\n\n---\n\n".join(
-                f"Title: {d['title']}\nContent: {d['content']}" for d in search_results
-            )
-            system_prompt = (
-                "You are a helpful Toronto municipal services assistant. "
-                "Answer the user's question based only on the provided bylaw context. "
-                "Be concise and cite the relevant bylaw or section. "
-                "If the context does not contain a clear answer, say so and suggest calling 311."
-            )
-            llm_messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {user_message}"},
-            ]
-            try:
-                response = await llm_client.invoke(llm_messages)
-                return AgentResponse(
-                    intent=Intent.GENERAL_INQUIRY,
-                    message=response,
-                    citations=citations,
-                )
-            except Exception as e:
-                print(f"[Agent] LLM general inquiry error: {e}")
-                # Fall through to Plan B response
-
-        # ── Plan B: format top RAG result directly ────────────────────────
-        top = search_results[0]
-        lines = [f"**{top['title']}**\n\n{top['content']}"]
-        if len(search_results) > 1:
-            lines.append(
-                f"\n\n---\n**Also relevant — {search_results[1]['title']}**\n\n"
-                f"{search_results[1]['content'][:300]}..."
-            )
-        lines.append(
-            "\n\n*For more details, contact Toronto 311 (call **311** or visit **toronto.ca/311**).*"
-        )
-        return AgentResponse(
-            intent=Intent.GENERAL_INQUIRY,
-            message="".join(lines),
-            citations=citations,
-        )
+        return data
 
     async def handle_hazard_report(
-        self, user_message: str, conversation_state: Dict[str, Any] = None
+        self,
+        user_message: str,
+        conversation_state: Dict[str, Any],
+        chat_history: List[Dict[str, str]] = None,
     ) -> AgentResponse:
-        if conversation_state is None:
-            conversation_state = {}
-
-        required_fields = ["location", "hazard_type", "description"]
-        missing = [f for f in required_fields if f not in conversation_state]
-
-        if not missing:
-            ticket_id = f"311-{abs(hash(str(conversation_state))) % 100000:05d}"
-            state_data = {k: v for k, v in conversation_state.items() if k != "awaiting"}
-            state_data["ticket_id"] = ticket_id
+        try:
+            response_text, citations = await self._llm_respond(
+                Intent.HAZARD_REPORT, user_message, chat_history or [],
+                extra_query="hazard safety toronto 311"
+            )
+            has_ticket = bool(_TICKET_RE.search(response_text))
+            if has_ticket:
+                extracted = self._extract_ticket_data(response_text, chat_history, user_message)
+                action = {"type": "hazard_report", "status": "completed", "data": extracted}
+            else:
+                action = {"type": "hazard_report", "status": "in_progress",
+                          "data": {**conversation_state, "awaiting": "location"}}
+            return AgentResponse(Intent.HAZARD_REPORT, response_text, action=action, citations=citations)
+        except Exception as e:
+            print(f"[Agent] LLM hazard error: {e}")
             return AgentResponse(
                 intent=Intent.HAZARD_REPORT,
                 message=(
-                    f"Your hazard report has been submitted successfully.\n\n"
-                    f"**Ticket ID:** `{ticket_id}`\n"
-                    f"**Location:** {state_data.get('location')}\n"
-                    f"**Hazard Type:** {state_data.get('hazard_type')}\n"
-                    f"**Description:** {state_data.get('description')}\n\n"
-                    f"Toronto 311 will investigate within **24–48 hours**. "
-                    f"You can track your request at **toronto.ca/311**."
+                    "I'm unable to process your hazard report right now. "
+                    "Please call **311** directly to report the hazard."
                 ),
-                action={"type": "hazard_report", "status": "completed", "data": state_data},
             )
 
-        next_field = missing[0]
-        prompts = {
-            "location": (
-                "I can help you report that hazard to Toronto 311. "
-                "What is the **location**? (street address or intersection)"
-            ),
-            "hazard_type": (
-                "What **type of hazard** is it?\n"
-                "*(e.g., pothole, fallen tree, debris, broken sidewalk, flooding)*"
-            ),
-            "description": "Please **describe** the hazard — size, severity, any immediate danger.",
-        }
-        state_data = {**conversation_state, "awaiting": next_field}
-        return AgentResponse(
-            intent=Intent.HAZARD_REPORT,
-            message=prompts[next_field],
-            action={"type": "hazard_report", "status": "in_progress", "data": state_data},
-        )
-
-    async def handle_permit_screener(self, user_message: str) -> AgentResponse:
-        if USE_LLM:
-            # ── Plan A: LLM analysis + RAG context ───────────────────────
-            search_results = rag.search(user_message + " building permit", top_k=2)
-            context = ""
-            citations = []
-            if search_results:
-                context = "\n\n".join(
-                    f"Title: {d['title']}\nContent: {d['content']}" for d in search_results
-                )
-                citations = [
-                    {"title": d["title"], "source": d["source"], "excerpt": d["content"][:200] + "..."}
-                    for d in search_results
-                ]
-            system_prompt = (
-                "You are a Toronto building permit expert. "
-                "Determine if a building permit is required for the described project. "
-                "Respond with: 1) YES/NO/POSSIBLY  2) Brief explanation with bylaw reference  "
-                "3) Recommended next steps."
+    async def handle_permit_screener(
+        self, user_message: str, chat_history: List[Dict[str, str]] = None
+    ) -> AgentResponse:
+        try:
+            response_text, citations = await self._llm_respond(
+                Intent.PERMIT_SCREENER, user_message, chat_history or [],
+                extra_query="building permit toronto construction"
             )
-            user_content = f"Bylaw context:\n{context}\n\nProject: {user_message}" if context else f"Project: {user_message}"
-            try:
-                response = await llm_client.invoke(
-                    [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}]
-                )
-                return AgentResponse(
-                    intent=Intent.PERMIT_SCREENER,
-                    message=response,
-                    action={"type": "permit_screener", "status": "completed", "data": {"project_description": user_message}},
-                    citations=citations,
-                )
-            except Exception as e:
-                print(f"[Agent] LLM permit error: {e}")
-                # Fall through to Plan B
+            return AgentResponse(
+                intent=Intent.PERMIT_SCREENER,
+                message=response_text,
+                action={"type": "permit_screener", "status": "completed",
+                        "data": {"project_description": user_message}},
+                citations=citations,
+            )
+        except Exception as e:
+            print(f"[Agent] LLM permit error: {e}")
+            return AgentResponse(
+                intent=Intent.PERMIT_SCREENER,
+                message=(
+                    "I'm unable to check permit requirements right now. "
+                    "Please visit **toronto.ca/building** or call **311**."
+                ),
+            )
 
-        # ── Plan B: rule-based permit decision ───────────────────────────
-        decision, explanation, steps = self._rule_based_permit(user_message)
-        message = f"**{decision}**\n\n{explanation}\n\n**Next Steps:**\n{steps}"
-        return AgentResponse(
-            intent=Intent.PERMIT_SCREENER,
-            message=message,
-            action={
-                "type": "permit_screener",
-                "status": "completed",
-                "data": {"project_description": user_message, "decision": decision},
-            },
-        )
-
-    async def handle_collection_lookup(self, user_message: str) -> AgentResponse:
-        postal_match = re.search(r"[A-Z]\d[A-Z]\s?\d[A-Z]\d", user_message.upper())
-        if not postal_match:
+    async def handle_collection_lookup(
+        self, user_message: str, chat_history: List[Dict[str, str]] = None
+    ) -> AgentResponse:
+        try:
+            response_text, citations = await self._llm_respond(
+                Intent.COLLECTION_LOOKUP, user_message, chat_history or [],
+                extra_query="waste disposal recycling toronto"
+            )
+            return AgentResponse(
+                intent=Intent.COLLECTION_LOOKUP,
+                message=response_text,
+                citations=citations,
+                action={"type": "collection_lookup", "status": "completed", "data": {}},
+            )
+        except Exception as e:
+            print(f"[Agent] LLM collection error: {e}")
             return AgentResponse(
                 intent=Intent.COLLECTION_LOOKUP,
                 message=(
-                    "Please provide your **postal code** to look up your waste collection schedule.\n\n"
-                    "*(e.g., M5V 3A8)*"
+                    "I'm unable to look up waste collection information right now. "
+                    "Please visit **toronto.ca/garbage** or call **311**."
                 ),
             )
-        postal_code = postal_match.group(0).replace(" ", "")
-        second_char = postal_code[1] if len(postal_code) > 1 else "5"
-        day_map = {
-            "1": "Monday", "2": "Tuesday", "3": "Wednesday",
-            "4": "Thursday", "5": "Friday", "6": "Monday",
-            "7": "Tuesday", "8": "Wednesday", "9": "Thursday",
-        }
-        collection_day = day_map.get(second_char, "Monday")
-        display_code = f"{postal_code[:3]} {postal_code[3:]}"
-        message = (
-            f"Here is your waste collection schedule for **{display_code}**:\n\n"
-            f"- 📅 **Collection Day:** {collection_day}\n"
-            f"- 🕖 Place bins at the curb by **7:00 AM**\n"
-            f"- 🌙 Remove bins by **midnight** the same day\n\n"
-            f"**Weekly collection includes:**\n"
-            f"- 🗑️ Garbage (black bin)\n"
-            f"- ♻️ Recyclables (blue bin)\n"
-            f"- 🌿 Organic waste (green bin)\n"
-            f"- 🍂 Yard waste in paper bags *(April – December)*\n\n"
-            f"For schedule exceptions or large-item pickup, call **311** or visit **toronto.ca/garbage**."
-        )
-        return AgentResponse(
-            intent=Intent.COLLECTION_LOOKUP,
-            message=message,
-            action={
-                "type": "collection_lookup",
-                "status": "completed",
-                "data": {"postal_code": postal_code, "collection_day": collection_day},
-            },
-        )
 
-    async def handle_out_of_scope(self) -> AgentResponse:
-        return AgentResponse(
-            intent=Intent.OUT_OF_SCOPE,
-            message=(
+    async def handle_out_of_scope(self, reason: str = "") -> AgentResponse:
+        if reason == "geography":
+            msg = (
+                "I'm only able to assist with municipal services within the **City of Toronto**. "
+                "The location you mentioned is outside Toronto's jurisdiction.\n\n"
+                "For services in that area, please contact the local municipality directly, "
+                "or call your regional 311 service."
+            )
+        else:
+            msg = (
                 "I'm designed specifically to help with **Toronto municipal services and bylaws**. "
                 "Your question appears to be outside my scope.\n\n"
-                "**For other inquiries:**\n"
-                "- Toronto 311: call **311** (24/7) or visit **toronto.ca/311**\n"
-                "- Ontario government: **ontario.ca**\n"
-                "- Federal services: **canada.ca**"
-            ),
-        )
+                "**What I can help with:**\n"
+                "- Reporting a hazard (pothole, fallen tree, etc.)\n"
+                "- Checking if a building permit is required\n"
+                "- Waste disposal and collection schedules\n\n"
+                "For other inquiries, call **311** or visit **toronto.ca/311**."
+            )
+        return AgentResponse(intent=Intent.OUT_OF_SCOPE, message=msg)
 
-    # ── Main router ───────────────────────────────────────────────────────────
+    # Main router (process_message)
+    # Execution order:
+    #   1. Prompt-injection guardrail
+    #   2. Geographic guardrail (non-Toronto cities)
+    #   3. Topic guardrail (weather, politics, etc.)
+    #   4. Multi-turn state continuation
+    #      - "awaiting": "waste_postal_code"  → handle_collection_lookup
+    #      - "awaiting": <hazard field>       → handle_hazard_report
+    #   5. Classify intent → dispatch to handler
 
     async def process_message(
-        self, user_message: str, conversation_state: Dict[str, Any] = None
+        self,
+        user_message: str,
+        conversation_state: Dict[str, Any] = None,
+        chat_history: List[Dict[str, str]] = None,
     ) -> AgentResponse:
         if conversation_state is None:
             conversation_state = {}
+        if chat_history is None:
+            chat_history = []
 
         # 1. Prompt-injection guard
         if self._is_prompt_injection(user_message):
@@ -406,23 +461,32 @@ class TorontoBylawAgent:
                 ),
             )
 
-        # 2. Continue active multi-turn flow (skip re-classification)
-        if "awaiting" in conversation_state:
-            field = conversation_state.pop("awaiting")
-            conversation_state[field] = user_message
-            return await self.handle_hazard_report(user_message, conversation_state)
+        # 2. Geographic guardrail (before classification so it can't be bypassed)
+        if self._is_non_toronto_location(user_message):
+            return await self.handle_out_of_scope(reason="geography")
 
-        # 3. Classify and route
-        intent = await self.classify_intent(user_message)
+        # 3. Topic guardrail (weather, politics, etc.)
+        if self._is_out_of_scope_topic(user_message):
+            return await self.handle_out_of_scope()
+
+        # 4. Continue active hazard multi-turn flows
+        if "awaiting" in conversation_state:
+            field = conversation_state["awaiting"]
+            conversation_state.pop("awaiting")
+            conversation_state[field] = user_message
+            return await self.handle_hazard_report(user_message, conversation_state, chat_history)
+
+        # 5. Classify and route
+        intent = await self.classify_intent(user_message, chat_history)
 
         if intent == Intent.GENERAL_INQUIRY:
-            return await self.handle_general_inquiry(user_message)
+            return await self.handle_general_inquiry(user_message, chat_history)
         elif intent == Intent.HAZARD_REPORT:
-            return await self.handle_hazard_report(user_message, conversation_state)
+            return await self.handle_hazard_report(user_message, conversation_state, chat_history)
         elif intent == Intent.PERMIT_SCREENER:
-            return await self.handle_permit_screener(user_message)
+            return await self.handle_permit_screener(user_message, chat_history)
         elif intent == Intent.COLLECTION_LOOKUP:
-            return await self.handle_collection_lookup(user_message)
+            return await self.handle_collection_lookup(user_message, chat_history)
         else:
             return await self.handle_out_of_scope()
 

@@ -42,6 +42,15 @@ toronto_bylaw.db
 
 # ChromaDB
 data/chroma_db/
+chroma_db/
+
+# Generated evaluation output
+data/evaluation_results.csv
+data/evaluation_summary.csv
+
+# Large raw data files (too big for GitHub — knowledge_base.json is the processed version)
+excel/311_service_requests.csv
+excel/Cleared Building Permits since 2017.json
 
 # Environment variables
 .env
@@ -52,8 +61,7 @@ data/chroma_db/
 *.log
 logs/
 
-# Streamlit
-.streamlit/
+# Streamlit — only exclude secrets, keep config.toml
 .streamlit/secrets.toml
 
 # Testing
