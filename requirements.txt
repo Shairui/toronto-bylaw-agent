@@ -2,7 +2,8 @@
 streamlit>=1.28.1
 
 # RAG / vector store
-chromadb>=0.6.0,<1.0.0    # 0.6+ fixes opentelemetry/protobuf conflicts on Streamlit Cloud
+chromadb==0.5.23
+opentelemetry-exporter-otlp-proto-grpc>=1.15.0  # Prevent chromadb pulling 1.11.1 which conflicts with protobuf 7.x
 
 # LLM client
 openai>=1.30.0             # Groq uses OpenAI-compatible API
