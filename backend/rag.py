@@ -1,10 +1,35 @@
 """RAG (Retrieval-Augmented Generation) knowledge base for Toronto bylaws."""
 import json
 import os
+import requests
 from typing import List, Dict, Any
 from pathlib import Path
 import chromadb
-from backend.config import CHROMA_DB_PATH, KNOWLEDGE_BASE_PATH
+from backend.config import (
+    CHROMA_DB_PATH, KNOWLEDGE_BASE_PATH,
+    EMBEDDING_API_KEY, EMBEDDING_API_BASE, EMBEDDING_MODEL,
+)
+
+
+class _ProfessorEmbeddingFn:
+    """Calls the professor's OpenAI-compatible embedding endpoint."""
+
+    def __init__(self):
+        self.url = f"{EMBEDDING_API_BASE.rstrip('/')}/embeddings"
+        self.headers = {
+            "Authorization": f"Bearer {EMBEDDING_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+    def __call__(self, input: List[str]) -> List[List[float]]:
+        resp = requests.post(
+            self.url,
+            headers=self.headers,
+            json={"model": EMBEDDING_MODEL, "input": input},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return [item["embedding"] for item in resp.json()["data"]]
 
 
 class TorontoBylawRAG:
@@ -12,10 +37,12 @@ class TorontoBylawRAG:
 
     def __init__(self):
         """Initialize RAG system with ChromaDB."""
-        self.client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+        self.client = chromadb.EphemeralClient()
+        embedding_fn = _ProfessorEmbeddingFn() if EMBEDDING_API_KEY else None
         self.collection = self.client.get_or_create_collection(
             name="toronto_bylaws",
-            metadata={"hnsw:space": "cosine"}
+            metadata={"hnsw:space": "cosine"},
+            embedding_function=embedding_fn,
         )
         self.knowledge_base = self._load_knowledge_base()
 

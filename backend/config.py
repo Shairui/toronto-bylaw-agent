@@ -1,6 +1,9 @@
 """Configuration management for Toronto Bylaw Agent."""
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Project root
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -24,6 +27,11 @@ FRONTEND_PORT = int(os.getenv("FRONTEND_PORT", "8501"))
 # RAG
 CHROMA_DB_PATH = os.getenv("CHROMA_DB_PATH", str(PROJECT_ROOT / "data" / "chroma_db"))
 KNOWLEDGE_BASE_PATH = os.getenv("KNOWLEDGE_BASE_PATH", str(PROJECT_ROOT / "data" / "knowledge_base.json"))
+
+# Embedding (professor's OpenAI-compatible endpoint)
+EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "")
+EMBEDDING_API_BASE = os.getenv("EMBEDDING_API_BASE", "https://rsm-8430-a2.bjlkeng.io/v1")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
 # Ensure directories exist
 os.makedirs(CHROMA_DB_PATH, exist_ok=True)
