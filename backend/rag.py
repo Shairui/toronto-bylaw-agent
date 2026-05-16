@@ -18,6 +18,7 @@ RAG results include cosine distance so callers can filter by relevance threshold
 import json
 import os
 import csv
+import re
 import requests
 from typing import List, Dict, Any
 from pathlib import Path
@@ -83,6 +84,7 @@ class TorontoBylawRAG:
         self.client = self._create_client()
         self.collection = self.client.get_or_create_collection(**collection_kwargs)
         self.knowledge_base = self._load_knowledge_base()
+        self.waste_items = self._load_waste_items()
 
     @staticmethod
     def _create_client() -> chromadb.PersistentClient:
@@ -163,6 +165,63 @@ class TorontoBylawRAG:
 
         print(f"[RAG] Loaded {len(docs)} waste categories from Waste Wizard.")
         return docs
+
+    @staticmethod
+    def _load_waste_items() -> List[Dict[str, Any]]:
+        if not _WASTE_JSON.exists():
+            return []
+        with open(_WASTE_JSON, encoding="utf-8") as f:
+            return json.load(f)
+
+    @staticmethod
+    def _normalise_text(text: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+    @staticmethod
+    def _keyword_tokens(text: str) -> List[str]:
+        stopwords = {
+            "where", "does", "do", "go", "goes", "put", "place", "which", "what",
+            "bin", "bins", "waste", "garbage", "trash", "recycle", "recycling",
+            "dispose", "disposal", "collection", "day", "old", "have", "has",
+            "the", "this", "that", "into", "for", "with", "and", "toronto",
+        }
+        tokens = []
+        for token in TorontoBylawRAG._normalise_text(text).split():
+            if len(token) <= 2 or token in stopwords:
+                continue
+            tokens.append(token[:-1] if token.endswith("s") and len(token) > 4 else token)
+        return tokens
+
+    def lookup_waste_item(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+        """Find likely Waste Wizard item matches without relying on the LLM."""
+        query_norm = self._normalise_text(query)
+        query_tokens = self._keyword_tokens(query)
+        if not query_tokens:
+            return []
+
+        scored = []
+        for item in self.waste_items:
+            item_name = item.get("item", "")
+            item_norm = self._normalise_text(item_name)
+            item_tokens = self._keyword_tokens(item_name)
+            score = 0
+
+            if item_norm and item_norm in query_norm:
+                score += 20
+            if query_norm and query_norm in item_norm:
+                score += 12
+
+            for token in query_tokens:
+                if token in item_tokens:
+                    score += 6
+                elif token in item_norm:
+                    score += 3
+
+            if score > 0:
+                scored.append((score, item))
+
+        scored.sort(key=lambda x: (-x[0], len(x[1].get("item", ""))))
+        return [item for _, item in scored[:top_k]]
 
     # Building permits (from excel file)
 

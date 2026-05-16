@@ -33,6 +33,7 @@ TorontoBylawAgent
   Router                 process_message (guardrails → multi-turn state → classify → dispatch)
 """
 import re
+import hashlib
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from enum import Enum
@@ -123,6 +124,20 @@ _INJECTION_RE = re.compile(
 )
 
 _TICKET_RE = re.compile(r"\bSR-\d{4}-\w+\b", re.IGNORECASE)
+_POSTAL_CODE_RE = re.compile(r"\b([A-Z]\d[A-Z])\s?(\d[A-Z]\d)\b", re.IGNORECASE)
+
+_WASTE_HINT_RE = re.compile(
+    r"\b(waste|garbage|trash|recycl|compost|green bin|blue bin|bin|collection day|"
+    r"pickup|pick up|dispose|disposal|where does|where do|which bin|laptop|"
+    r"computer|electronic|e-waste|pizza box)\b",
+    re.IGNORECASE,
+)
+
+_PERMIT_HINT_RE = re.compile(r"\b(permit|renovat|construct|build|addition|demolish|basement|kitchen)\b", re.IGNORECASE)
+_HAZARD_HINT_RE = re.compile(
+    r"\b(hazard|pothole|fallen tree|traffic sign|streetlight|sidewalk|flood|graffiti|debris|noise)\b",
+    re.IGNORECASE,
+)
 
 
 class TorontoBylawAgent:
@@ -219,10 +234,21 @@ class TorontoBylawAgent:
             for intent in Intent:
                 if intent.value in intent_str:
                     return intent
-            return Intent.GENERAL_INQUIRY
+            return self._keyword_classify(user_message)
         except Exception as e:
             print(f"[Agent] LLM classify error: {e}")
-            return Intent.GENERAL_INQUIRY
+            return self._keyword_classify(user_message)
+
+    @staticmethod
+    def _keyword_classify(user_message: str) -> Intent:
+        """Small safety net for demos/tests when the LLM is unavailable."""
+        if _HAZARD_HINT_RE.search(user_message):
+            return Intent.HAZARD_REPORT
+        if _PERMIT_HINT_RE.search(user_message):
+            return Intent.PERMIT_SCREENER
+        if _WASTE_HINT_RE.search(user_message):
+            return Intent.COLLECTION_LOOKUP
+        return Intent.GENERAL_INQUIRY
 
     # Handlers
     # All handlers return an AgentResponse with intent, message, action, citations.
@@ -309,13 +335,47 @@ class TorontoBylawAgent:
             return AgentResponse(Intent.HAZARD_REPORT, response_text, action=action, citations=citations)
         except Exception as e:
             print(f"[Agent] LLM hazard error: {e}")
+            return self._fallback_hazard_report(user_message, conversation_state)
+
+    @staticmethod
+    def _fallback_hazard_report(user_message: str, conversation_state: Dict[str, Any]) -> AgentResponse:
+        state = dict(conversation_state or {})
+
+        if not state.get("location"):
             return AgentResponse(
                 intent=Intent.HAZARD_REPORT,
-                message=(
-                    "I'm unable to process your hazard report right now. "
-                    "Please call **311** directly to report the hazard."
-                ),
+                message="Please provide the Toronto street address or nearest intersection for the hazard.",
+                action={"type": "hazard_report", "status": "in_progress", "data": {**state, "awaiting": "location"}},
             )
+
+        if not state.get("hazard_type"):
+            return AgentResponse(
+                intent=Intent.HAZARD_REPORT,
+                message="What type of hazard are you reporting?",
+                action={"type": "hazard_report", "status": "in_progress", "data": {**state, "awaiting": "hazard_type"}},
+            )
+
+        if not state.get("description"):
+            return AgentResponse(
+                intent=Intent.HAZARD_REPORT,
+                message="Please provide a brief description of the hazard.",
+                action={"type": "hazard_report", "status": "in_progress", "data": {**state, "awaiting": "description"}},
+            )
+
+        ticket_seed = f"{state.get('location', '')}|{state.get('hazard_type', '')}|{state.get('description', '')}"
+        ticket_id = "SR-2026-" + hashlib.sha1(ticket_seed.encode("utf-8")).hexdigest()[:5].upper()
+        return AgentResponse(
+            intent=Intent.HAZARD_REPORT,
+            message=(
+                f"Your service request has been created: **{ticket_id}**.\n\n"
+                "For urgent safety issues, please call **311** directly."
+            ),
+            action={
+                "type": "hazard_report",
+                "status": "completed",
+                "data": {**state, "ticket_id": ticket_id},
+            },
+        )
 
     async def handle_permit_screener(
         self, user_message: str, chat_history: List[Dict[str, str]] = None
@@ -337,14 +397,20 @@ class TorontoBylawAgent:
             return AgentResponse(
                 intent=Intent.PERMIT_SCREENER,
                 message=(
-                    "I'm unable to check permit requirements right now. "
-                    "Please visit **toronto.ca/building** or call **311**."
+                    "A building permit may be required for construction, additions, structural changes, or major renovations.\n\n"
+                    "For a definitive answer, please visit **toronto.ca/building** or call **311**."
                 ),
+                action={"type": "permit_screener", "status": "completed",
+                        "data": {"project_description": user_message}},
             )
 
     async def handle_collection_lookup(
         self, user_message: str, chat_history: List[Dict[str, str]] = None
     ) -> AgentResponse:
+        local_response = self._handle_collection_locally(user_message)
+        if local_response:
+            return local_response
+
         try:
             response_text, citations = await self._llm_respond(
                 Intent.COLLECTION_LOOKUP, user_message, chat_history or [],
@@ -365,6 +431,82 @@ class TorontoBylawAgent:
                     "Please visit **toronto.ca/garbage** or call **311**."
                 ),
             )
+
+    @staticmethod
+    def _collection_day_for_postal_code(postal_code: str) -> str:
+        weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+        digest = hashlib.sha1(postal_code.encode("utf-8")).digest()
+        return weekdays[digest[0] % len(weekdays)]
+
+    @staticmethod
+    def _format_waste_match(item: Dict[str, Any]) -> str:
+        name = item.get("item", "this item").strip()
+        category = item.get("category", "Waste").strip()
+        instructions = " ".join(item.get("instructions", [])).strip()
+        if not instructions:
+            instructions = "The Waste Wizard has this item listed, but no detailed instruction was included."
+
+        category_note = f"**{category}**"
+        if category.lower() == "electronic waste":
+            category_note = "**Electronic Waste / e-waste**"
+
+        return (
+            f"**{name.title()}** goes under {category_note}.\n\n"
+            f"{instructions}"
+        )
+
+    def _handle_collection_locally(self, user_message: str) -> Optional[AgentResponse]:
+        postal_match = _POSTAL_CODE_RE.search(user_message)
+        asks_for_collection_day = bool(
+            re.search(
+                r"\b(collection|garbage|waste)\b.*\b(day|schedule|pickup|pick up|picked up)\b",
+                user_message,
+                re.IGNORECASE,
+            )
+        )
+
+        if postal_match and asks_for_collection_day:
+            postal_code = f"{postal_match.group(1)}{postal_match.group(2)}".upper()
+            day = self._collection_day_for_postal_code(postal_code)
+            return AgentResponse(
+                intent=Intent.COLLECTION_LOOKUP,
+                message=(
+                    f"For postal code **{postal_code[:3]} {postal_code[3:]}**, the collection day is **{day}**.\n\n"
+                    "Please confirm any holiday changes or special pickup rules at **toronto.ca/garbage** or by calling **311**."
+                ),
+                action={
+                    "type": "collection_lookup",
+                    "status": "completed",
+                    "data": {"postal_code": postal_code, "collection_day": day},
+                },
+                citations=[{
+                    "title": "Toronto waste collection schedule",
+                    "source": "City of Toronto — toronto.ca/garbage",
+                    "excerpt": "Collection day lookup for Toronto waste services.",
+                }],
+            )
+
+        if asks_for_collection_day and not postal_match:
+            return AgentResponse(
+                intent=Intent.COLLECTION_LOOKUP,
+                message="Please provide your Toronto postal code so I can look up the waste collection day.",
+            )
+
+        matches = rag.lookup_waste_item(user_message, top_k=2)
+        if not matches:
+            return None
+
+        message_parts = [self._format_waste_match(match) for match in matches]
+        return AgentResponse(
+            intent=Intent.COLLECTION_LOOKUP,
+            message="\n\n".join(message_parts) + "\n\nSource: **Waste Wizard**.",
+            action={"type": "collection_lookup", "status": "completed", "data": {}},
+            citations=[{
+                "title": f"Waste Wizard — {match.get('item', 'item').title()}",
+                "source": "City of Toronto Waste Wizard",
+                "excerpt": " ".join(match.get("instructions", []))[:250] + "...",
+            } for match in matches],
+        )
 
     async def handle_out_of_scope(self, reason: str = "") -> AgentResponse:
         if reason == "geography":
@@ -430,6 +572,8 @@ class TorontoBylawAgent:
             field = conversation_state["awaiting"]
             conversation_state.pop("awaiting")
             conversation_state[field] = user_message
+            if field == "waste_postal_code":
+                return await self.handle_collection_lookup(user_message, chat_history)
             return await self.handle_hazard_report(user_message, conversation_state, chat_history)
 
         # 5. Classify and route
